@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from 'react'
 import confetti from 'canvas-confetti'
-import { Play, RotateCcw, Trophy, Heart, Maximize2 } from 'lucide-react'
+import { Play, RotateCcw, Trophy, Heart, Volume2, VolumeX } from 'lucide-react'
 
 // --- Types ---
 interface Ball {
@@ -12,6 +12,9 @@ interface Ball {
   dy: number
   radius: number
   image?: HTMLImageElement | null
+  isAttached?: boolean // For sticky powerup
+  offsetX?: number // Offset from paddle center when attached
+  isThrough?: boolean // For penetrator powerup
 }
 
 interface Paddle {
@@ -20,6 +23,7 @@ interface Paddle {
   width: number
   height: number
   color: string
+  isSticky?: boolean
 }
 
 interface Brick {
@@ -47,7 +51,7 @@ interface PowerUp {
   x: number
   y: number
   dy: number
-  type: 'blue_balls' | 'jizztime'
+  type: 'blue_balls' | 'jizztime' | 'girthy' | 'clingy' | 'penetrator'
   width: number
   height: number
 }
@@ -58,22 +62,36 @@ const CHARACTERS = [
   { name: 'Sagi Tits', image: '/assets/sagitits.png', color: '#8b5cf6' },
 ]
 
-const MOTIVATIONAL_MESSAGES = [
+/**
+ * Motivations are intentionally weighted:
+ * - "core" lines show up most often
+ * - "extras" are rare spice
+ *
+ * Note: avoiding body-shaming insults as motivations.
+ */
+const CORE_MOTIVATIONS = [
+  "I never lie.",
+  "Dave's not here, man.",
+  "Looking in your big brown eye.",
+  "Push it, push it some more.",
+  "Pistols at dawn !",
+] as const
+
+const EXTRA_MOTIVATIONS = [
   "A la la la la long",
   "Sweat till you can't sweat no more",
   "Girl I want to make you sweat",
-  "Push it some more",
-  "I never lie",
-  "Dave's not here, man",
-  "Pistols at dawn !",
-  "You look so skinny, Alice"
-]
+] as const
 
-// --- Helper: Beautiful Colors ---
-// Using a more vibrant, "beautiful" palette instead of muddy browns
+function pickMotivation(): string {
+  // 80% core, 20% extras
+  const pool = Math.random() < 0.8 ? CORE_MOTIVATIONS : EXTRA_MOTIVATIONS
+  return pool[Math.floor(Math.random() * pool.length)]
+}
+
 const COLORS = {
-  background: 'linear-gradient(to bottom, #000000, #1a1a1a)', // Black gradient
-  paddle: '#facc15', // Yellow
+  background: 'linear-gradient(to bottom, #000000, #1a1a1a)',
+  paddle: '#facc15',
   text: '#ffffff',
   brickColors: [
     '#f472b6', // Pink 400
@@ -81,9 +99,15 @@ const COLORS = {
     '#60a5fa', // Blue 400
     '#34d399', // Emerald 400
   ],
-  unbreakable: '#475569', // Slate 600
-  hole: '#3f2e18', // Keep the hole brown as requested by name, but maybe styled better
-  rasta: ['#ff0000', '#f1c40f', '#008000'] // Red, Yellow, Green
+  unbreakable: '#475569',
+  hole: '#3f2e18',
+  powerUps: {
+    blue_balls: '#3b82f6',
+    jizztime: '#ffffff',
+    girthy: '#8b5cf6', // Purple
+    clingy: '#10b981', // Green
+    penetrator: '#ef4444' // Red
+  }
 }
 
 export default function Game() {
@@ -94,10 +118,11 @@ export default function Game() {
   const [gameState, setGameState] = useState<'menu' | 'playing' | 'level_transition' | 'won' | 'gameover'>('menu')
   const [score, setScore] = useState(0)
   const [level, setLevel] = useState(1)
-  const [lives, setLives] = useState(5) // Changed to 5 lives
+  const [lives, setLives] = useState(5)
   const [message, setMessage] = useState('')
   const [selectedCharacter, setSelectedCharacter] = useState(0)
-  const [lostBall, setLostBall] = useState(false) // Visual cue for lost ball
+  const [lostBall, setLostBall] = useState(false)
+  const [isMuted, setIsMuted] = useState(false)
   
   // Refs
   const ballsRef = useRef<Ball[]>([])
@@ -108,31 +133,101 @@ export default function Game() {
   const requestRef = useRef<number | null>(null)
   const characterImageRef = useRef<HTMLImageElement | null>(null)
   const holeRef = useRef<{x: number, y: number}>({ x: 0, y: 0 })
+  const shakeRef = useRef(0)
   
-  // Canvas Size Management
-  const [canvasSize, setCanvasSize] = useState({ width: 0, height: 0 })
+  // Audio Refs
+  const audioContextRef = useRef<AudioContext | null>(null)
+  const songRef = useRef<HTMLAudioElement | null>(null)
+
+  // --- Audio System ---
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      songRef.current = new Audio('/assets/sweat.mp3') // User needs to add this file
+      songRef.current.loop = false
+    }
+    
+    return () => {
+      if (songRef.current) {
+        songRef.current.pause()
+        songRef.current = null
+      }
+      if (audioContextRef.current) {
+        audioContextRef.current.close()
+      }
+    }
+  }, [])
+
+  const playSound = (type: 'hit' | 'paddle' | 'powerup' | 'win' | 'lose') => {
+    if (isMuted) return
+    
+    if (!audioContextRef.current) {
+      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)()
+    }
+
+    const ctx = audioContextRef.current
+    const osc = ctx.createOscillator()
+    const gain = ctx.createGain()
+
+    osc.connect(gain)
+    gain.connect(ctx.destination)
+
+    const now = ctx.currentTime
+
+    switch (type) {
+      case 'hit':
+        osc.type = 'sine'
+        osc.frequency.setValueAtTime(400, now)
+        osc.frequency.exponentialRampToValueAtTime(0.01, now + 0.1)
+        gain.gain.setValueAtTime(0.3, now)
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.1)
+        osc.start(now)
+        osc.stop(now + 0.1)
+        break
+      case 'paddle':
+        osc.type = 'square'
+        osc.frequency.setValueAtTime(200, now)
+        osc.frequency.exponentialRampToValueAtTime(0.01, now + 0.1)
+        gain.gain.setValueAtTime(0.2, now)
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.1)
+        osc.start(now)
+        osc.stop(now + 0.1)
+        break
+      case 'powerup':
+        osc.type = 'triangle'
+        osc.frequency.setValueAtTime(300, now)
+        osc.frequency.linearRampToValueAtTime(600, now + 0.1)
+        gain.gain.setValueAtTime(0.2, now)
+        gain.gain.linearRampToValueAtTime(0.01, now + 0.2)
+        osc.start(now)
+        osc.stop(now + 0.2)
+        break
+      case 'lose':
+        osc.type = 'sawtooth'
+        osc.frequency.setValueAtTime(100, now)
+        osc.frequency.exponentialRampToValueAtTime(0.01, now + 0.3)
+        gain.gain.setValueAtTime(0.3, now)
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.3)
+        osc.start(now)
+        osc.stop(now + 0.3)
+        break
+    }
+  }
 
   // --- Resize Handler ---
   const handleResize = useCallback(() => {
     if (containerRef.current) {
       const { clientWidth, clientHeight } = containerRef.current
-      setCanvasSize({ width: clientWidth, height: clientHeight })
       
-      // Update canvas dimensions immediately to avoid stretching
       if (canvasRef.current) {
         canvasRef.current.width = clientWidth
         canvasRef.current.height = clientHeight
       }
       
-      // Reposition paddle if out of bounds
       if (paddleRef.current.x > clientWidth) {
         paddleRef.current.x = clientWidth / 2 - paddleRef.current.width / 2
       }
       
-      // Reposition Hole
-      // If playing, keep relative or just update
       if (gameState === 'playing') {
-         // We might need to re-init bricks or scale positions, but for now let's just ensure hole is visible
          holeRef.current.x = Math.min(Math.max(holeRef.current.x, 50), clientWidth - 50)
       }
     }
@@ -147,7 +242,6 @@ export default function Game() {
   // --- Game Logic ---
 
   const getBrickColor = (health: number) => {
-    // Cycle through beautiful colors based on health
     return COLORS.brickColors[(health - 1) % COLORS.brickColors.length]
   }
 
@@ -155,24 +249,24 @@ export default function Game() {
     const canvas = canvasRef.current
     if (!canvas) return
     
-    const speed = 4 + currentLevel * 0.5
-    const direction = Math.random() > 0.5 ? 1 : -1
-    
     ballsRef.current = [{
       x: canvas.width / 2,
       y: canvas.height - 100,
-      dx: speed * direction,
-      dy: -speed,
+      dx: 0,
+      dy: 0,
       radius: 12,
-      image: characterImageRef.current
+      image: characterImageRef.current,
+      isAttached: true,
+      offsetX: 0
     }]
     
     paddleRef.current = {
       x: (canvas.width - 100) / 2,
-      y: canvas.height - 40, // Higher up for mobile thumbs
+      y: canvas.height - 60,
       width: Math.max(60, 100 - (currentLevel * 5)),
       height: 15,
-      color: COLORS.paddle
+      color: COLORS.paddle,
+      isSticky: false
     }
     
     powerUpsRef.current = []
@@ -184,23 +278,18 @@ export default function Game() {
 
     resetBallAndPaddle(currentLevel)
 
-    // Randomize Hole Position
     const holeX = Math.random() * (canvas.width - 100) + 50
-    holeRef.current = { x: holeX, y: 60 } // Lower y for visibility
+    holeRef.current = { x: holeX, y: 60 }
 
-    // Create Bricks - Fill the screen more
     const brickWidth = canvas.width < 500 ? 40 : 60
     const brickHeight = 25
     const brickPadding = 5
     const brickOffsetTop = 120
-    const brickOffsetLeft = 10
     
     const brickColumnCount = Math.floor((canvas.width - 20) / (brickWidth + brickPadding))
     const brickRowCount = 6 + currentLevel
 
     const newBricks: Brick[] = []
-    
-    // Center the grid
     const totalRowWidth = brickColumnCount * (brickWidth + brickPadding) - brickPadding
     const startX = (canvas.width - totalRowWidth) / 2
 
@@ -210,9 +299,8 @@ export default function Game() {
         const y = (r * (brickHeight + brickPadding)) + brickOffsetTop
 
         const distToHole = Math.sqrt(Math.pow(x - holeRef.current.x, 2) + Math.pow(y - holeRef.current.y, 2))
-        if (distToHole < 60) continue; // Don't spawn on hole
+        if (distToHole < 60) continue;
 
-        // Determine brick type
         let type: 'normal' | 'unbreakable' = 'normal'
         let health = 1
         let maxHealth = 1
@@ -261,18 +349,33 @@ export default function Game() {
     setGameState('playing')
     setScore(0)
     setLevel(1)
-    setLives(5) // Start with 5 lives
-    // Small timeout to ensure canvas size is ready
+    setLives(5)
     setTimeout(() => initGame(1), 50)
+  }
+
+  const launchBalls = () => {
+    ballsRef.current.forEach(ball => {
+      if (ball.isAttached) {
+        ball.isAttached = false
+        ball.dy = -(4 + level * 0.5)
+        ball.dx = (Math.random() - 0.5) * 8
+      }
+    })
   }
 
   const triggerLevelTransition = () => {
     setGameState('level_transition')
-    // "Push it" meme moment
     setMessage("PUSH IT!")
+    
+    if (songRef.current && !isMuted) {
+      songRef.current.currentTime = 0
+      songRef.current.play().catch(e => console.log("Audio play failed", e))
+    }
     
     setTimeout(() => {
       setMessage('')
+      if (songRef.current) songRef.current.pause()
+      
       if (level >= 5) {
         setGameState('won')
         confetti({ particleCount: 200, spread: 160, origin: { y: 0.6 } })
@@ -281,7 +384,73 @@ export default function Game() {
         setGameState('playing')
         initGame(level + 1)
       }
-    }, 3000) // 3 seconds of "Push it"
+    }, 4000)
+  }
+
+  const spawnPowerUp = (x: number, y: number) => {
+      if (Math.random() > 0.2) return
+
+      const types: PowerUp['type'][] = ['blue_balls', 'jizztime', 'girthy', 'clingy', 'penetrator']
+      const rand = Math.random()
+      let type: PowerUp['type'] = 'blue_balls'
+      
+      if (rand < 0.3) type = 'blue_balls'
+      else if (rand < 0.5) type = 'jizztime'
+      else if (rand < 0.7) type = 'girthy'
+      else if (rand < 0.85) type = 'clingy'
+      else type = 'penetrator'
+
+      powerUpsRef.current.push({
+          x,
+          y,
+          dy: 2.5,
+          type,
+          width: 30,
+          height: 30
+      })
+  }
+
+  const activatePowerUp = (type: PowerUp['type']) => {
+      const canvas = canvasRef.current
+      if (!canvas || ballsRef.current.length === 0) return
+
+      const baseBall = ballsRef.current[0]
+      playSound('powerup')
+
+      switch(type) {
+        case 'blue_balls':
+          ballsRef.current.push({
+              x: baseBall.x, y: baseBall.y, dx: (Math.random() - 0.5) * 8, dy: -Math.abs(baseBall.dy),
+              radius: baseBall.radius, image: baseBall.image
+          })
+          setMessage("Blue Balls!")
+          break
+        case 'jizztime':
+          for(let i=0; i<2; i++) {
+            ballsRef.current.push({
+                x: baseBall.x, y: baseBall.y, dx: (Math.random() - 0.5) * 8, dy: -Math.abs(baseBall.dy),
+                radius: baseBall.radius, image: baseBall.image
+            })
+          }
+          setMessage("Jizztime!")
+          break
+        case 'girthy':
+          paddleRef.current.width = Math.min(canvas.width * 0.4, paddleRef.current.width * 1.5)
+          setMessage("Girthy!")
+          break
+        case 'clingy':
+          paddleRef.current.isSticky = true
+          setMessage("Clingy!")
+          break
+        case 'penetrator':
+          ballsRef.current.forEach(b => b.isThrough = true)
+          setMessage("Penetrator!")
+          setTimeout(() => {
+             ballsRef.current.forEach(b => b.isThrough = false)
+          }, 10000)
+          break
+      }
+      setTimeout(() => setMessage(''), 1500)
   }
 
   // --- Game Loop ---
@@ -301,21 +470,31 @@ export default function Game() {
       const hole = holeRef.current
       const powerUps = powerUpsRef.current
 
+      // Screen Shake
+      if (shakeRef.current > 0) {
+        ctx.save()
+        const dx = (Math.random() - 0.5) * shakeRef.current
+        const dy = (Math.random() - 0.5) * shakeRef.current
+        ctx.translate(dx, dy)
+        shakeRef.current *= 0.9
+        if (shakeRef.current < 0.5) shakeRef.current = 0
+      }
+
       // Clear
-      ctx.clearRect(0, 0, canvas.width, canvas.height)
+      ctx.clearRect(-10, -10, canvas.width + 20, canvas.height + 20)
 
       // Draw Hole
       ctx.beginPath()
       ctx.arc(hole.x, hole.y, 35, 0, Math.PI * 2)
       ctx.fillStyle = COLORS.hole
       ctx.fill()
-      ctx.strokeStyle = '#fbbf24' // Gold ring
+      ctx.strokeStyle = '#fbbf24'
       ctx.lineWidth = 4
       ctx.stroke()
       ctx.fillStyle = '#fff'
       ctx.font = 'bold 12px Arial'
       ctx.textAlign = 'center'
-      ctx.fillText('BROWN HOLE', hole.x, hole.y + 5) // Updated text
+      ctx.fillText('BROWN HOLE', hole.x, hole.y + 5)
       ctx.closePath()
 
       // Draw Bricks
@@ -325,11 +504,8 @@ export default function Game() {
           ctx.roundRect(brick.x, brick.y, brick.width, brick.height, 4)
           ctx.fillStyle = brick.type === 'unbreakable' ? COLORS.unbreakable : getBrickColor(brick.health)
           ctx.fill()
-          // Shine effect
           ctx.fillStyle = 'rgba(255,255,255,0.1)'
           ctx.fill()
-          ctx.strokeStyle = 'rgba(0,0,0,0.1)'
-          ctx.stroke()
           
           if (brick.type !== 'unbreakable' && brick.health > 1) {
              ctx.fillStyle = 'rgba(255,255,255,0.8)'
@@ -343,13 +519,13 @@ export default function Game() {
       // Draw Paddle
       ctx.beginPath()
       ctx.roundRect(paddle.x, paddle.y, paddle.width, paddle.height, 8)
-      ctx.fillStyle = paddle.color
+      ctx.fillStyle = paddle.isSticky ? COLORS.powerUps.clingy : paddle.color
       ctx.fill()
       ctx.shadowColor = 'rgba(0,0,0,0.2)'
       ctx.shadowBlur = 10
       ctx.shadowOffsetY = 5
       ctx.closePath()
-      ctx.shadowColor = 'transparent' // Reset shadow
+      ctx.shadowColor = 'transparent'
 
       // Draw PowerUps
       for (let i = powerUps.length - 1; i >= 0; i--) {
@@ -358,41 +534,33 @@ export default function Game() {
           
           ctx.beginPath()
           ctx.arc(p.x, p.y, 15, 0, Math.PI*2)
-          ctx.fillStyle = p.type === 'blue_balls' ? '#3b82f6' : '#ffffff'
+          ctx.fillStyle = COLORS.powerUps[p.type] || '#fff'
           ctx.fill()
           ctx.strokeStyle = '#fff'
           ctx.lineWidth = 2
           ctx.stroke()
-          ctx.fillStyle = p.type === 'blue_balls' ? '#fff' : '#000'
+          
+          ctx.fillStyle = '#fff'
           ctx.font = 'bold 10px Arial'
           ctx.textAlign = 'center'
-          ctx.fillText(p.type === 'blue_balls' ? 'BB' : 'JT', p.x, p.y + 4)
+          let label = ''
+          switch(p.type) {
+            case 'blue_balls': label = 'BB'; break;
+            case 'jizztime': label = 'JT'; break;
+            case 'girthy': label = '<>'; break;
+            case 'clingy': label = 'U'; break;
+            case 'penetrator': label = '^'; break;
+          }
+          ctx.fillText(label, p.x, p.y + 4)
           ctx.closePath()
 
-          // Collision PowerUp
           if (
               p.y + 15 >= paddle.y && 
               p.y - 15 <= paddle.y + paddle.height &&
               p.x >= paddle.x && 
               p.x <= paddle.x + paddle.width
           ) {
-              // Activate
-              const baseBall = ballsRef.current[0]
-              if (baseBall) {
-                const count = p.type === 'blue_balls' ? 1 : 2
-                for(let k=0; k<count; k++) {
-                    ballsRef.current.push({
-                        x: baseBall.x,
-                        y: baseBall.y,
-                        dx: (Math.random() - 0.5) * 8,
-                        dy: -Math.abs(baseBall.dy),
-                        radius: baseBall.radius,
-                        image: baseBall.image
-                    })
-                }
-                setMessage(p.type === 'blue_balls' ? "Blue Balls!" : "Jizztime!")
-                setTimeout(() => setMessage(''), 1500)
-              }
+              activatePowerUp(p.type)
               powerUps.splice(i, 1)
               continue
           }
@@ -403,7 +571,14 @@ export default function Game() {
       for (let i = ballsRef.current.length - 1; i >= 0; i--) {
           const ball = ballsRef.current[i]
 
-          // Draw
+          if (ball.isAttached) {
+            ball.x = paddle.x + paddle.width/2 + (ball.offsetX || 0)
+            ball.y = paddle.y - ball.radius
+          } else {
+            ball.x += ball.dx
+            ball.y += ball.dy
+          }
+
           ctx.beginPath()
           if (ball.image) {
             ctx.save()
@@ -418,20 +593,22 @@ export default function Game() {
             ctx.fillStyle = CHARACTERS[selectedCharacter].color
             ctx.fill()
           }
+          if (ball.isThrough) {
+             ctx.strokeStyle = '#ef4444'
+             ctx.lineWidth = 2
+             ctx.stroke()
+          }
           ctx.closePath()
 
-          // Move
-          ball.x += ball.dx
-          ball.y += ball.dy
+          if (ball.isAttached) continue
 
-          // Hole Collision
           const distToHole = Math.sqrt(Math.pow(ball.x - hole.x, 2) + Math.pow(ball.y - hole.y, 2))
           if (distToHole < 35 + ball.radius) {
+            shakeRef.current = 20
             triggerLevelTransition()
             return
           }
 
-          // Wall Collision
           if (ball.x + ball.dx > canvas.width - ball.radius) {
             ball.x = canvas.width - ball.radius
             ball.dx = -ball.dx
@@ -444,27 +621,32 @@ export default function Game() {
             ball.y = ball.radius
             ball.dy = -ball.dy
           } else if (ball.y + ball.dy > canvas.height - ball.radius) {
-            // Paddle Hit
             if (ball.x > paddle.x && ball.x < paddle.x + paddle.width) {
-              const hitPoint = ball.x - (paddle.x + paddle.width / 2)
-              const normalizedHit = hitPoint / (paddle.width / 2)
-              ball.dy = -Math.abs(ball.dy)
-              ball.dx = normalizedHit * 6
-              ball.dx *= 1.02
-              ball.dy *= 1.02
+              playSound('paddle')
+              
+              if (paddle.isSticky) {
+                ball.isAttached = true
+                ball.offsetX = ball.x - (paddle.x + paddle.width/2)
+                ball.dx = 0
+                ball.dy = 0
+              } else {
+                const hitPoint = ball.x - (paddle.x + paddle.width / 2)
+                const normalizedHit = hitPoint / (paddle.width / 2)
+                ball.dy = -Math.abs(ball.dy)
+                ball.dx = normalizedHit * 8
+                ball.dx *= 1.02
+                ball.dy *= 1.02
+              }
             } else {
-              // Lost
               ballsRef.current.splice(i, 1)
-              
-              // Visual cue for lost ball
               setLostBall(true)
+              shakeRef.current = 10
+              playSound('lose')
               setTimeout(() => setLostBall(false), 200)
-              
               continue
             }
           }
 
-          // Brick Collision
           bricks.forEach(brick => {
             if (brick.status === 1) {
               if (
@@ -473,35 +655,25 @@ export default function Game() {
                 ball.y > brick.y &&
                 ball.y < brick.y + brick.height
               ) {
-                ball.dy = -ball.dy
+                if (!ball.isThrough) {
+                  ball.dy = -ball.dy
+                }
                 
                 if (brick.type !== 'unbreakable') {
                     brick.health -= 1
+                    playSound('hit')
+                    if (ball.isThrough) brick.health = 0
+
                     if (brick.health <= 0) {
                         brick.status = 0
                         setScore(prev => prev + 10)
-                        
-                        // Drop PowerUp
-                        if (Math.random() < 0.15) {
-                            const type = Math.random() > 0.5 ? 'blue_balls' : 'jizztime'
-                            powerUpsRef.current.push({
-                                x: brick.x + brick.width/2,
-                                y: brick.y,
-                                dy: 3,
-                                type,
-                                width: 30,
-                                height: 30
-                            })
-                        }
+                        spawnPowerUp(brick.x + brick.width/2, brick.y + brick.height/2)
 
-                        // Motivation
-                        if (Math.random() < 0.1) {
-                          const msg = MOTIVATIONAL_MESSAGES[Math.floor(Math.random() * MOTIVATIONAL_MESSAGES.length)]
-                          setMessage(msg)
+                        if (Math.random() < 0.12) {
+                          setMessage(pickMotivation())
                           setTimeout(() => setMessage(''), 2000)
                         }
                         
-                        // Particles
                         for (let k = 0; k < 6; k++) {
                           particlesRef.current.push({
                             x: brick.x + brick.width / 2,
@@ -515,13 +687,17 @@ export default function Game() {
                     } else {
                         brick.color = getBrickColor(brick.health)
                     }
+                } else {
+                   if (ball.isThrough) {
+                      ball.dy = -ball.dy 
+                   }
+                   playSound('hit')
                 }
               }
             }
           })
       }
 
-      // Lives check
       if (ballsRef.current.length === 0) {
           if (lives > 1) {
             setLives(prev => prev - 1)
@@ -532,13 +708,11 @@ export default function Game() {
           return
       }
 
-      // Clear check
       if (bricks.filter(b => b.status === 1 && b.type !== 'unbreakable').length === 0) {
         triggerLevelTransition()
         return
       }
 
-      // Particles
       particlesRef.current.forEach((p, index) => {
         p.x += p.dx
         p.y += p.dy
@@ -550,6 +724,8 @@ export default function Game() {
         if (p.life <= 0) particlesRef.current.splice(index, 1)
       })
 
+      if (shakeRef.current > 0) ctx.restore()
+
       requestRef.current = requestAnimationFrame(update)
     }
 
@@ -559,7 +735,6 @@ export default function Game() {
     }
   }, [gameState, level, selectedCharacter, lives])
 
-  // Input Handling
   const handleMove = (clientX: number) => {
     if (!canvasRef.current) return
     const rect = canvasRef.current.getBoundingClientRect()
@@ -569,12 +744,10 @@ export default function Game() {
     }
   }
 
-  const handleMouseMove = (e: React.MouseEvent) => {
-    handleMove(e.clientX)
-  }
-  
-  const handleTouchMove = (e: React.TouchEvent) => {
-    handleMove(e.touches[0].clientX)
+  const handleInput = () => {
+    if (gameState === 'playing') {
+      launchBalls()
+    }
   }
 
   return (
@@ -582,29 +755,33 @@ export default function Game() {
       ref={containerRef}
       className={`fixed inset-0 w-full h-[100dvh] overflow-hidden flex flex-col items-center justify-center font-sans transition-colors duration-200 ${lostBall ? 'bg-red-900/50' : ''}`}
       style={{ background: lostBall ? undefined : COLORS.background }}
+      onClick={handleInput}
+      onTouchStart={handleInput}
     >
-      {/* Top Bar */}
       {gameState !== 'menu' && (
         <div className="absolute top-0 left-0 w-full p-4 flex justify-between items-center text-white font-bold z-10 pointer-events-none">
           <div className="flex gap-4 bg-black/20 backdrop-blur-md px-4 py-2 rounded-full">
             <span>{score} pts</span>
             <span className="flex items-center gap-1"><Heart size={16} className="fill-red-500 text-red-500"/> {lives}</span>
           </div>
-          <div className="bg-black/20 backdrop-blur-md px-4 py-2 rounded-full">
-            Level {level}
+          <div className="flex gap-2">
+             <button onClick={(e) => { e.stopPropagation(); setIsMuted(!isMuted) }} className="bg-black/20 backdrop-blur-md p-2 rounded-full pointer-events-auto">
+                {isMuted ? <VolumeX size={20} /> : <Volume2 size={20} />}
+             </button>
+             <div className="bg-black/20 backdrop-blur-md px-4 py-2 rounded-full">
+               Level {level}
+             </div>
           </div>
         </div>
       )}
 
-      {/* Game Canvas */}
       <canvas
         ref={canvasRef}
         className={`block touch-none ${gameState === 'menu' ? 'opacity-0 pointer-events-none' : 'opacity-100'}`}
-        onMouseMove={handleMouseMove}
-        onTouchMove={handleTouchMove}
+        onMouseMove={(e) => handleMove(e.clientX)}
+        onTouchMove={(e) => handleMove(e.touches[0].clientX)}
       />
 
-      {/* Yelling Guy Overlay */}
       {message && gameState !== 'level_transition' && (
         <div className="absolute top-0 left-0 z-30 pointer-events-none flex items-start animate-slide-in-left mt-16 ml-4">
            <img 
@@ -618,7 +795,6 @@ export default function Game() {
         </div>
       )}
 
-      {/* Push It Transition */}
       {gameState === 'level_transition' && (
         <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black/90 backdrop-blur-md animate-pulse">
            <div className="text-center mb-8">
@@ -630,19 +806,16 @@ export default function Game() {
              </p>
            </div>
            
-           {/* Reggae/Sweat Vibe Animation */}
-           <div className="relative w-64 h-64 flex items-center justify-center">
-              <div className="absolute inset-0 border-8 border-green-500 rounded-full animate-spin-slow opacity-50"></div>
-              <div className="absolute inset-4 border-8 border-yellow-500 rounded-full animate-spin-reverse opacity-50"></div>
-              <div className="absolute inset-8 border-8 border-red-500 rounded-full animate-spin-slow opacity-50"></div>
-              <div className="text-8xl">🥵</div>
-           </div>
+           <img 
+              src="/assets/inner-circle.svg" 
+              alt="Sweat" 
+              className="w-64 h-64 animate-bounce" 
+           />
 
            <p className="text-white text-2xl mt-8 font-bold">Push it some more...</p>
         </div>
       )}
 
-      {/* Menu Screen */}
       {gameState === 'menu' && (
         <div className="absolute inset-0 flex flex-col items-center justify-center text-white z-20 p-4">
           <h1 className="text-6xl md:text-8xl font-black mb-2 text-transparent bg-clip-text bg-gradient-to-r from-yellow-400 to-pink-500 drop-shadow-lg tracking-tighter text-center">
@@ -654,7 +827,7 @@ export default function Game() {
             {CHARACTERS.map((char, idx) => (
               <button
                 key={char.name}
-                onClick={() => setSelectedCharacter(idx)}
+                onClick={(e) => { e.stopPropagation(); setSelectedCharacter(idx) }}
                 className={`group relative p-4 rounded-3xl transition-all duration-300 transform hover:scale-110 border-4 ${
                   selectedCharacter === idx 
                       ? 'border-yellow-400 bg-white/10 shadow-[0_0_30px_rgba(250,204,21,0.5)] scale-110' 
@@ -672,7 +845,7 @@ export default function Game() {
           </div>
           
           <button
-            onClick={startGame}
+            onClick={(e) => { e.stopPropagation(); startGame() }}
             className="w-full max-w-sm py-6 bg-gradient-to-r from-yellow-400 to-orange-500 hover:from-yellow-300 hover:to-orange-400 text-brown-900 rounded-full text-3xl font-black transition-all transform hover:scale-105 shadow-[0_10px_0_rgb(161,98,7)] active:shadow-none active:translate-y-[10px] flex items-center justify-center gap-4"
           >
             START GAME <Play size={32} className="fill-current" />
@@ -680,23 +853,19 @@ export default function Game() {
         </div>
       )}
 
-      {/* Game Over Screen - Redesigned */}
       {gameState === 'gameover' && (
         <div className="absolute inset-0 bg-black/90 flex flex-col items-center justify-center text-white z-50 p-6">
-          {/* Score in Middle (Top of content) */}
           <div className="flex flex-col items-center mb-8">
              <span className="text-2xl text-gray-400 uppercase tracking-widest mb-2">Final Score</span>
              <span className="text-8xl font-black text-yellow-400">{score}</span>
           </div>
 
-          {/* Game Over below score */}
           <h2 className="text-5xl md:text-7xl font-black text-red-500 mb-16 tracking-tighter uppercase drop-shadow-[0_5px_0_rgba(150,0,0,0.5)]">
             GAME OVER
           </h2>
 
-          {/* Try Again at Bottom */}
           <button
-            onClick={() => setGameState('menu')}
+            onClick={(e) => { e.stopPropagation(); setGameState('menu') }}
             className="w-full max-w-xs py-6 bg-white text-black hover:bg-gray-200 rounded-full text-2xl font-bold transition-transform hover:scale-105 shadow-xl flex items-center justify-center gap-3"
           >
             <RotateCcw size={28} /> TRY AGAIN
@@ -704,7 +873,6 @@ export default function Game() {
         </div>
       )}
 
-      {/* Won Screen */}
       {gameState === 'won' && (
         <div className="absolute inset-0 bg-yellow-500 flex flex-col items-center justify-center text-white z-50 p-6">
           <Trophy size={96} className="mb-6 text-white animate-bounce" />
